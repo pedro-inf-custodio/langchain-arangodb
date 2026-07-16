@@ -2939,4 +2939,4 @@ async = ["python-arango-async"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<4.0"
-content-hash = "d448e04fb9985c47c6f4a418db6a79ccdbfe8ba53d13dc50422b5083103d8c88"
+content-hash = "a46cb40f4380683d9ac5a6462d98aab8945478c7a14aaf33d231f0083d57207c"
