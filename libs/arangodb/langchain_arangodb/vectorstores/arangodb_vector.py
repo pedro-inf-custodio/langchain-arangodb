@@ -189,6 +189,10 @@ class ArangoVector(VectorStore):
 
         self.collection = self.db.collection(self.collection_name)
 
+        # Auto-provision keyword index for HYBRID search
+        if self.search_type == SearchType.HYBRID:
+            self.create_keyword_index()
+
     @property
     def embeddings(self) -> Embeddings:
         return self.embedding
@@ -361,13 +365,13 @@ class ArangoVector(VectorStore):
 
             if len(data) == batch_size:
                 await collection.import_bulk(
-                    json.dumps(data), on_duplicate="update", doc_type="array"
+                    json.dumps(data), on_duplicate="update", doc_type="array", **kwargs
                 )
                 data = []
 
         if data:
             await collection.import_bulk(
-                json.dumps(data), on_duplicate="update", doc_type="array"
+                json.dumps(data), on_duplicate="update", doc_type="array", **kwargs
             )
 
         return ids
@@ -858,9 +862,7 @@ class ArangoVector(VectorStore):
 
         collection = self.async_db.collection(self.collection_name)
         for result in await collection.delete_many(ids, **kwargs):
-            if not isinstance(AsyncArangoServerError, type) and isinstance(
-                result, AsyncArangoServerError
-            ):
+            if isinstance(result, AsyncArangoServerError):
                 raise result
 
         return True
@@ -1037,7 +1039,7 @@ class ArangoVector(VectorStore):
                     {filter_clause if not use_approx else ""}
                     LET score = {score_func}(doc.{self.embedding_field}, @embedding)
                     SORT score {sort_order}
-                    LIMIT {k}
+                    LIMIT @rrf_search_limit
                     {filter_clause if use_approx else ""}
                     WINDOW {{ preceding: "unbounded", following: 0 }}
                     AGGREGATE rank = COUNT(1)
@@ -1051,7 +1053,7 @@ class ArangoVector(VectorStore):
                     {filter_clause}
                     LET score = BM25(doc)
                     SORT score DESC
-                    LIMIT {k}
+                    LIMIT @rrf_search_limit
                     WINDOW {{ preceding: "unbounded", following: 0 }}
                     AGGREGATE rank = COUNT(1)
                     LET rrf_score = {keyword_weight} / ({self.rrf_constant} + rank)
@@ -1061,7 +1063,7 @@ class ArangoVector(VectorStore):
             FOR result IN APPEND(vector_results, keyword_results)
                 COLLECT key = result.key AGGREGATE score = SUM(result.score)
                 SORT score DESC
-                LIMIT {self.rrf_search_limit}
+                LIMIT @k
                 LET data = FIRST(
                     FOR doc IN @@collection
                         FILTER doc._key == key
@@ -1078,6 +1080,8 @@ class ArangoVector(VectorStore):
             "embedding": embedding,
             "query": query,
             "analyzer": self.keyword_analyzer,
+            "k": k,
+            "rrf_search_limit": self.rrf_search_limit,
         }
 
         return aql_query, bind_vars
@@ -1743,7 +1747,7 @@ class ArangoVector(VectorStore):
                     {filter_clause if not use_approx else ""}
                     LET score = {score_func}(doc.{self.embedding_field}, @embedding)
                     SORT score {sort_order}
-                    LIMIT {k}
+                    LIMIT @rrf_search_limit
                     {filter_clause if use_approx else ""}
                     WINDOW {{ preceding: "unbounded", following: 0 }}
                     AGGREGATE rank = COUNT(1)
@@ -1757,7 +1761,7 @@ class ArangoVector(VectorStore):
                     {filter_clause}
                     LET score = BM25(doc)
                     SORT score DESC
-                    LIMIT {k}
+                    LIMIT @rrf_search_limit
                     WINDOW {{ preceding: "unbounded", following: 0 }}
                     AGGREGATE rank = COUNT(1)
                     LET rrf_score = {keyword_weight} / ({self.rrf_constant} + rank)
@@ -1767,7 +1771,7 @@ class ArangoVector(VectorStore):
             FOR result IN APPEND(vector_results, keyword_results)
                 COLLECT key = result.key AGGREGATE score = SUM(result.score)
                 SORT score DESC
-                LIMIT {self.rrf_search_limit}
+                LIMIT @k
                 LET data = FIRST(
                     FOR doc IN @@collection
                         FILTER doc._key == key
