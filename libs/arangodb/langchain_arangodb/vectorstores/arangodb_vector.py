@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Type, Union
 
@@ -13,6 +14,20 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from langchain_core.vectorstores.utils import maximal_marginal_relevance
 from packaging import version
+
+try:
+    from arangoasync.cursor import (
+        Cursor as AsyncCursor,  # ty: ignore[unresolved-import]
+    )
+    from arangoasync.database import (
+        StandardDatabase as AsyncStandardDatabase,  # ty: ignore[unresolved-import]
+    )
+    from arangoasync.exceptions import (
+        ArangoServerError as AsyncArangoServerError,  # ty: ignore[unresolved-import]
+    )
+except ImportError:
+    AsyncStandardDatabase = None
+    AsyncCursor = None
 
 from langchain_arangodb.vectorstores.utils import DistanceStrategy
 
@@ -112,6 +127,11 @@ class ArangoVector(VectorStore):
     :param rrf_search_limit: The maximum number of results to consider in RRF scoring.
         Defaults to 100.
     :type rrf_search_limit: int
+    :param async_database: Optional `arangoasync.database.StandardDatabase` instance
+        from the `python-arango-async` library. When provided, all async methods
+        (`aadd_texts`, `adelete`, `aget_by_ids`, `asimilarity_search`, etc.) will use
+        this client for true async I/O instead of falling back to a thread executor.
+    :type async_database: Optional[arangoasync.database.StandardDatabase]
     """
 
     def __init__(
@@ -131,6 +151,7 @@ class ArangoVector(VectorStore):
         keyword_analyzer: str = DEFAULT_ANALYZER,
         rrf_constant: int = DEFAULT_RRF_CONSTANT,
         rrf_search_limit: int = DEFAULT_SEARCH_LIMIT,
+        async_database: Any = None,
     ):
         if search_type not in [SearchType.VECTOR, SearchType.HYBRID]:
             raise ValueError("search_type must be 'vector' or 'hybrid'")
@@ -145,7 +166,8 @@ class ArangoVector(VectorStore):
         self.embedding = embedding
         self.embedding_dimension = int(embedding_dimension)
         self.db = database
-        self.async_db = self.db.begin_async_execution(return_result=False)
+        self.async_db: Optional[Any] = async_database
+        self._arango_async_db = self.db.begin_async_execution(return_result=False)
         self.search_type = search_type
         self.collection_name = collection_name
         self.embedding_field = embedding_field
@@ -250,7 +272,16 @@ class ArangoVector(VectorStore):
         insert_text: bool = True,
         **kwargs: Any,
     ) -> List[str]:
-        """Add embeddings to the vectorstore."""
+        """Add embeddings to the vectorstore.
+
+        :param use_async_db: When True, uses the python-arango async execution
+            context (fire-and-forget job queue via
+            ``db.begin_async_execution(return_result=False)``). This is *not*
+            true async I/O — it dispatches jobs to ArangoDB's internal async
+            queue and does not await results. For true async I/O use
+            ``aadd_embeddings`` together with an ``async_database`` client.
+        :type use_async_db: bool
+        """
         texts = list(texts)
 
         if ids is None:
@@ -263,7 +294,7 @@ class ArangoVector(VectorStore):
             m = "Length of ids, texts, embeddings and metadatas must be the same."
             raise ValueError(m)
 
-        db = self.async_db if use_async_db else self.db
+        db = self._arango_async_db if use_async_db else self.db
         collection = db.collection(self.collection_name)
 
         data = []
@@ -285,6 +316,45 @@ class ArangoVector(VectorStore):
                 data = []
 
         collection.import_bulk(data, on_duplicate="update", **kwargs)
+
+        return ids
+
+    async def aadd_embeddings(
+        self,
+        texts: Iterable[str],
+        embeddings: List[List[float]],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+        batch_size: int = 500,
+        insert_text: bool = True,
+        **kwargs: Any,
+    ) -> List[str]:
+        """Async add embeddings to the vectorstore using python-arango-async."""
+        if self.async_db is None:
+            raise ValueError("async_database must be provided to use async methods.")
+
+        texts = list(texts)
+
+        if ids is None:
+            ids = [str(farmhash.Fingerprint64(text.encode("utf-8"))) for text in texts]  # type: ignore
+
+        if not metadatas:
+            metadatas = [{} for _ in texts]
+
+        collection = self.async_db.collection(self.collection_name)
+
+        data = []
+        for _key, text, embedding, metadata in zip(ids, texts, embeddings, metadatas):
+            doc: dict[str, Any] = {self.text_field: text} if insert_text else {}
+            doc.update({**metadata, "_key": _key, self.embedding_field: embedding})
+            data.append(doc)
+
+            if len(data) == batch_size:
+                await collection.import_bulk(json.dumps(data), on_duplicate="update")
+                data = []
+
+        if data:
+            await collection.import_bulk(json.dumps(data), on_duplicate="update")
 
         return ids
 
@@ -337,6 +407,20 @@ class ArangoVector(VectorStore):
         embeddings = self.embedding.embed_documents(list(texts))
 
         return self.add_embeddings(
+            texts=texts, embeddings=embeddings, metadatas=metadatas, ids=ids, **kwargs
+        )
+
+    async def aadd_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> List[str]:
+        """Async add texts using python-arango-async."""
+        texts = list(texts)
+        embeddings = await self.embedding.aembed_documents(texts)
+        return await self.aadd_embeddings(
             texts=texts, embeddings=embeddings, metadatas=metadatas, ids=ids, **kwargs
         )
 
@@ -742,6 +826,23 @@ class ArangoVector(VectorStore):
 
         return True
 
+    async def adelete(
+        self, ids: Optional[List[str]] = None, **kwargs: Any
+    ) -> Optional[bool]:
+        """Async delete by vector ID using python-arango-async."""
+        if self.async_db is None:
+            raise ValueError("async_database must be provided to use async methods.")
+
+        if not ids:
+            return None
+
+        collection = self.async_db.collection(self.collection_name)
+        for result in await collection.delete_many(ids, **kwargs):
+            if isinstance(result, AsyncArangoServerError):
+                raise result
+
+        return True
+
     def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
         """Get documents by their IDs.
 
@@ -760,6 +861,119 @@ class ArangoVector(VectorStore):
             docs.append(Document(page_content=page_content, id=_key, metadata=doc))
 
         return docs
+
+    async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
+        """Async get documents by their IDs using python-arango-async."""
+        if self.async_db is None:
+            raise ValueError("async_database must be provided to use async methods.")
+
+        collection = self.async_db.collection(self.collection_name)
+        docs = []
+        for doc in await collection.get_many(list(ids)):
+            doc = dict(doc)
+            _key = doc.pop("_key")
+            page_content = doc.pop(self.text_field)
+            docs.append(Document(page_content=page_content, id=_key, metadata=doc))
+
+        return docs
+
+    async def asimilarity_search(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> List[Document]:
+        """Async similarity search using python-arango-async."""
+        results = await self.asimilarity_search_with_score(query, k=k, **kwargs)
+        return [doc for doc, _ in results]
+
+    async def asimilarity_search_with_score(
+        self,
+        query: str,
+        k: int = 4,
+        return_fields: set[str] = set(),
+        use_approx: bool = True,
+        embedding: Optional[List[float]] = None,
+        filter_clause: str = "",
+        search_type: Optional[SearchType] = None,
+        vector_weight: float = 1.0,
+        keyword_weight: float = 1.0,
+        keyword_search_clause: str = "",
+        metadata_clause: str = "",
+        **kwargs: Any,
+    ) -> List[tuple[Document, float]]:
+        """Async similarity search with scores using python-arango-async."""
+        if self.async_db is None:
+            raise ValueError("async_database must be provided to use async methods.")
+
+        search_type = search_type or self.search_type
+        embedding = embedding or await self.embedding.aembed_query(query)
+
+        if search_type == SearchType.VECTOR:
+            aql_query, bind_vars = self._build_vector_search_query(
+                embedding=embedding,
+                k=k,
+                return_fields=return_fields,
+                use_approx=use_approx,
+                filter_clause=filter_clause,
+                metadata_clause=metadata_clause,
+            )
+        else:
+            aql_query, bind_vars = self._build_hybrid_search_query(
+                query=query,
+                k=k,
+                embedding=embedding,
+                return_fields=return_fields,
+                use_approx=use_approx,
+                filter_clause=filter_clause,
+                vector_weight=vector_weight,
+                keyword_weight=keyword_weight,
+                keyword_search_clause=keyword_search_clause,
+                metadata_clause=metadata_clause,
+            )
+
+        cursor = await self.async_db.aql.execute(
+            aql_query, bind_vars=bind_vars, stream=True
+        )
+        return await self._async_process_search_query(cursor)
+
+    async def asimilarity_search_by_vector(
+        self,
+        embedding: List[float],
+        k: int = 4,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Async similarity search by vector using python-arango-async."""
+        results = await self.asimilarity_search_with_score(
+            query="", k=k, embedding=embedding, search_type=SearchType.VECTOR, **kwargs
+        )
+        return [doc for doc, _ in results]
+
+    async def amax_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        return_fields: set[str] = set(),
+        use_approx: bool = True,
+        embedding: Optional[List[float]] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Async MMR search using python-arango-async."""
+        return_fields.add(self.embedding_field)
+        query_embedding = embedding or await self.embedding.aembed_query(query)
+
+        docs = await self.asimilarity_search_by_vector(
+            embedding=query_embedding,
+            k=fetch_k,
+            return_fields=return_fields,
+            use_approx=use_approx,
+            **kwargs,
+        )
+
+        embeddings = [doc.metadata[self.embedding_field] for doc in docs]
+        selected_indices = maximal_marginal_relevance(
+            np.array(query_embedding), embeddings, lambda_mult=lambda_mult, k=k
+        )
+        return [docs[i] for i in selected_indices]
 
     def max_marginal_relevance_search(
         self,
@@ -1203,6 +1417,35 @@ class ArangoVector(VectorStore):
 
             if cursor.has_more():
                 cursor.fetch()
+
+        return results
+
+    async def _async_process_search_query(
+        self, cursor: Any
+    ) -> List[tuple[Document, float]]:
+        """Process search results from an async ArangoDB cursor."""
+        results = []
+
+        while not cursor.empty():
+            for result in cursor.batch():
+                data = dict(result["data"])
+                score: float = result["score"]
+                metadata = dict(result["metadata"])
+                _key = data.pop("_key")
+                page_content = data.pop(self.text_field)
+                results.append(
+                    (
+                        Document(
+                            page_content=page_content,
+                            id=_key,
+                            metadata={**data, **metadata},
+                        ),
+                        score,
+                    )
+                )
+
+            if cursor.has_more():
+                await cursor.fetch()
 
         return results
 

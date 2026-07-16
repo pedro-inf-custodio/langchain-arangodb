@@ -1,11 +1,12 @@
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from langchain_arangodb.vectorstores.arangodb_vector import (
     ArangoVector,
     DistanceStrategy,
+    SearchType,
     StandardDatabase,
 )
 
@@ -15,11 +16,10 @@ def mock_vector_store() -> ArangoVector:
     """Create a mock ArangoVector instance for testing."""
     mock_db = MagicMock()
     mock_collection = MagicMock()
-    mock_async_db = MagicMock()
 
     mock_db.has_collection.return_value = True
     mock_db.collection.return_value = mock_collection
-    mock_db.begin_async_execution.return_value = mock_async_db
+    mock_db.begin_async_execution.return_value = MagicMock()
 
     with patch(
         "langchain_arangodb.vectorstores.arangodb_vector.StandardDatabase",
@@ -45,16 +45,16 @@ def arango_vector_factory() -> Any:
         text_embeddings: Optional[list[tuple[str, list[float]]]] = None,
         collection_exists: bool = True,
         vector_index_exists: bool = True,
+        async_database: Optional[Any] = None,
         **kwargs: Any,
     ) -> Any:
         mock_db = MagicMock()
         mock_collection = MagicMock()
-        mock_async_db = MagicMock()
 
         # Configure has_collection
         mock_db.has_collection.return_value = collection_exists
         mock_db.collection.return_value = mock_collection
-        mock_db.begin_async_execution.return_value = mock_async_db
+        mock_db.begin_async_execution.return_value = MagicMock()
 
         # Configure vector index
         if vector_index_exists:
@@ -83,6 +83,7 @@ def arango_vector_factory() -> Any:
         common_kwargs = {
             "embedding": embedding,
             "database": mock_db,
+            "async_database": async_database,
             **kwargs,
         }
 
@@ -1184,3 +1185,383 @@ def test_search_type_override_in_similarity_search(arango_vector_factory: Any) -
 
     mock_vector_search.assert_called_once()
     assert docs == expected_docs
+
+
+# ---------------------------------------------------------------------------
+# use_async_db tests (python-arango fire-and-forget job queue)
+# ---------------------------------------------------------------------------
+
+
+def test_add_embeddings_use_async_db_false(arango_vector_factory: Any) -> None:
+    """When use_async_db=False (default), import_bulk is called on the sync db."""
+    vector_store = arango_vector_factory()
+
+    texts = ["text1", "text2"]
+    embeddings = [[0.1] * 64, [0.2] * 64]
+
+    vector_store.add_embeddings(texts=texts, embeddings=embeddings, use_async_db=False)
+
+    # The sync collection (via self.db) must have been used
+    vector_store.db.collection.assert_called_with(vector_store.collection_name)
+    vector_store.collection.import_bulk.assert_called()
+
+
+def test_add_embeddings_use_async_db_true(arango_vector_factory: Any) -> None:
+    """
+    When use_async_db=True, import_bulk is called on the arango async-execution db.
+    """
+    mock_async_exec_db = MagicMock()
+    mock_async_exec_collection = MagicMock()
+    mock_async_exec_db.collection.return_value = mock_async_exec_collection
+
+    vector_store = arango_vector_factory()
+    # Patch the internal _arango_async_db (begin_async_execution result)
+    vector_store._arango_async_db = mock_async_exec_db
+
+    texts = ["text1", "text2"]
+    embeddings = [[0.1] * 64, [0.2] * 64]
+
+    vector_store.add_embeddings(texts=texts, embeddings=embeddings, use_async_db=True)
+
+    # The async-execution collection must have been used, not the sync one
+    mock_async_exec_db.collection.assert_called_with(vector_store.collection_name)
+    mock_async_exec_collection.import_bulk.assert_called()
+    # The sync collection must NOT have been called for import_bulk
+    vector_store.collection.import_bulk.assert_not_called()
+
+
+def test_add_embeddings_use_async_db_default_is_false(
+    arango_vector_factory: Any,
+) -> None:
+    """use_async_db defaults to False — sync db is used when arg is omitted."""
+    vector_store = arango_vector_factory()
+
+    mock_async_exec_db = MagicMock()
+    vector_store._arango_async_db = mock_async_exec_db
+
+    vector_store.add_embeddings(texts=["t"], embeddings=[[0.1] * 64])
+
+    # Async-execution db must NOT have been touched
+    mock_async_exec_db.collection.assert_not_called()
+    vector_store.collection.import_bulk.assert_called()
+
+
+def test_arango_async_db_set_on_init(arango_vector_factory: Any) -> None:
+    """_arango_async_db is set via begin_async_execution during __init__."""
+    vector_store = arango_vector_factory()
+    vector_store.db.begin_async_execution.assert_called_once_with(return_result=False)
+    assert vector_store._arango_async_db is not None
+
+
+def test_use_async_db_and_async_database_are_independent(
+    arango_vector_factory: Any,
+) -> None:
+    """use_async_db (sync driver job queue) and async_database (true async) are
+    independent: one can be set without the other."""
+    mock_async_exec_db = MagicMock()
+    mock_true_async_db = MagicMock()
+
+    vector_store = arango_vector_factory(async_database=mock_true_async_db)
+    vector_store._arango_async_db = mock_async_exec_db
+
+    # async_database is stored for true-async methods
+    assert vector_store.async_db is mock_true_async_db
+    # _arango_async_db is the fire-and-forget job queue
+    assert vector_store._arango_async_db is mock_async_exec_db
+
+
+# ---------------------------------------------------------------------------
+# Async unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_async_vector_store(async_db: Any = None, **kwargs: Any) -> ArangoVector:
+    """Helper: build an ArangoVector with a sync mock db and optional async_db."""
+    mock_db = MagicMock()
+    mock_db.has_collection.return_value = True
+    mock_db.collection.return_value = MagicMock()
+    return ArangoVector(
+        embedding=MagicMock(),
+        embedding_dimension=64,
+        database=mock_db,
+        async_database=async_db,
+        **kwargs,
+    )
+
+
+def _make_async_db() -> MagicMock:
+    """Return a MagicMock that mimics arangoasync StandardDatabase."""
+    async_db = MagicMock()
+    async_collection = MagicMock()
+    async_collection.import_bulk = AsyncMock(return_value={})
+    async_collection.delete_many = AsyncMock(return_value=[])
+    async_collection.get_many = AsyncMock(return_value=[])
+    async_db.collection.return_value = async_collection
+    async_db.aql = MagicMock()
+    async_db.aql.execute = AsyncMock()
+    return async_db
+
+
+# --- guard: async methods raise when async_db is None ---
+
+
+async def test_aadd_texts_requires_async_db() -> None:
+    store = _make_async_vector_store()
+    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64])
+    with pytest.raises(ValueError, match="async_database must be provided"):
+        await store.aadd_texts(["hello"])
+
+
+async def test_adelete_requires_async_db() -> None:
+    store = _make_async_vector_store()
+    with pytest.raises(ValueError, match="async_database must be provided"):
+        await store.adelete(ids=["id1"])
+
+
+async def test_aget_by_ids_requires_async_db() -> None:
+    store = _make_async_vector_store()
+    with pytest.raises(ValueError, match="async_database must be provided"):
+        await store.aget_by_ids(["id1"])
+
+
+async def test_asimilarity_search_with_score_requires_async_db() -> None:
+    store = _make_async_vector_store()
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+    with pytest.raises(ValueError, match="async_database must be provided"):
+        await store.asimilarity_search_with_score("query")
+
+
+# --- happy-path async tests ---
+
+
+async def test_aadd_texts_calls_import_bulk() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64, [0.2] * 64])
+
+    ids = await store.aadd_texts(["text1", "text2"])
+
+    assert len(ids) == 2
+    async_db.collection.return_value.import_bulk.assert_called_once()
+    # Verify the payload is a JSON string (arangoasync requirement)
+    call_arg = async_db.collection.return_value.import_bulk.call_args[0][0]
+    import json
+
+    docs = json.loads(call_arg)
+    assert docs[0]["text"] == "text1"
+    assert docs[1]["text"] == "text2"
+
+
+async def test_adelete_calls_delete_many() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+
+    result = await store.adelete(ids=["id1", "id2"])
+
+    assert result is True
+    async_db.collection.return_value.delete_many.assert_called_once_with(["id1", "id2"])
+
+
+async def test_adelete_returns_none_for_empty_ids() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+
+    result = await store.adelete(ids=[])
+
+    assert result is None
+    async_db.collection.return_value.delete_many.assert_not_called()
+
+
+async def test_aget_by_ids_returns_documents() -> None:
+    async_db = _make_async_db()
+    async_db.collection.return_value.get_many = AsyncMock(
+        return_value=[
+            {"_key": "id1", "text": "hello", "meta": "val"},
+        ]
+    )
+    store = _make_async_vector_store(async_db=async_db)
+
+    docs = await store.aget_by_ids(["id1"])
+
+    assert len(docs) == 1
+    assert docs[0].page_content == "hello"
+    assert docs[0].id == "id1"
+    assert docs[0].metadata["meta"] == "val"
+
+
+async def test_asimilarity_search_delegates_to_with_score() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+
+    expected = [MagicMock(), MagicMock()]
+    with patch.object(
+        store,
+        "asimilarity_search_with_score",
+        new=AsyncMock(return_value=[(d, 0.9) for d in expected]),
+    ) as mock_ws:
+        docs = await store.asimilarity_search("query", k=2)
+
+    mock_ws.assert_called_once_with("query", k=2)
+    assert docs == expected
+
+
+async def test_asimilarity_search_with_score_vector() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+
+    mock_cursor = MagicMock()
+    mock_cursor.empty.return_value = True
+    async_db.aql.execute = AsyncMock(return_value=mock_cursor)
+
+    with patch.object(
+        store, "_build_vector_search_query", return_value=("AQL", {"bind": "vars"})
+    ):
+        results = await store.asimilarity_search_with_score(
+            "query", k=2, search_type=SearchType.VECTOR
+        )
+
+    async_db.aql.execute.assert_called_once_with(
+        "AQL", bind_vars={"bind": "vars"}, stream=True
+    )
+    assert results == []
+
+
+async def test_asimilarity_search_with_score_hybrid() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db, search_type=SearchType.HYBRID)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+
+    mock_cursor = MagicMock()
+    mock_cursor.empty.return_value = True
+    async_db.aql.execute = AsyncMock(return_value=mock_cursor)
+
+    with patch.object(
+        store,
+        "_build_hybrid_search_query",
+        return_value=("AQL_HYBRID", {"bind": "vars"}),
+    ):
+        results = await store.asimilarity_search_with_score(
+            "query", k=2, search_type=SearchType.HYBRID
+        )
+
+    async_db.aql.execute.assert_called_once_with(
+        "AQL_HYBRID", bind_vars={"bind": "vars"}, stream=True
+    )
+    assert results == []
+
+
+async def test_asimilarity_search_by_vector_delegates() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+
+    expected_doc = MagicMock()
+    with patch.object(
+        store,
+        "asimilarity_search_with_score",
+        new=AsyncMock(return_value=[(expected_doc, 0.8)]),
+    ) as mock_ws:
+        docs = await store.asimilarity_search_by_vector([0.1] * 64, k=1)
+
+    mock_ws.assert_called_once()
+    assert docs == [expected_doc]
+
+
+async def test_amax_marginal_relevance_search() -> None:
+    async_db = _make_async_db()
+    store = _make_async_vector_store(async_db=async_db)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+
+    mock_docs = [MagicMock() for _ in range(3)]
+    for i, doc in enumerate(mock_docs):
+        doc.metadata = {store.embedding_field: [float(i)] * 64}
+
+    with (
+        patch.object(
+            store,
+            "asimilarity_search_by_vector",
+            new=AsyncMock(return_value=mock_docs),
+        ),
+        patch(
+            "langchain_arangodb.vectorstores.arangodb_vector.maximal_marginal_relevance",
+            return_value=[0, 2],
+        ) as mock_mmr,
+    ):
+        results = await store.amax_marginal_relevance_search(
+            "query", k=2, fetch_k=3, lambda_mult=0.5
+        )
+
+    mock_mmr.assert_called_once()
+    assert results == [mock_docs[0], mock_docs[2]]
+
+
+async def test_async_process_search_query_single_page() -> None:
+    """
+    Test _async_process_search_query with a cursor that has all results in one page.
+    """
+    store = _make_async_vector_store()
+
+    mock_cursor = MagicMock()
+    mock_cursor.empty.return_value = False
+    mock_cursor.has_more.return_value = False
+    mock_cursor.batch.return_value = [
+        {
+            "data": {"_key": "k1", "text": "hello", "extra": "x"},
+            "score": 0.9,
+            "metadata": {},
+        },
+        {
+            "data": {"_key": "k2", "text": "world", "extra": "y"},
+            "score": 0.7,
+            "metadata": {"m": 1},
+        },
+    ]
+    # Second call to empty() returns True to exit the loop
+    mock_cursor.empty.side_effect = [False, True]
+
+    results = await store._async_process_search_query(mock_cursor)
+
+    assert len(results) == 2
+    doc1, score1 = results[0]
+    assert doc1.page_content == "hello"
+    assert doc1.id == "k1"
+    assert score1 == 0.9
+
+    doc2, score2 = results[1]
+    assert doc2.page_content == "world"
+    assert doc2.metadata["m"] == 1
+    assert score2 == 0.7
+
+
+async def test_async_process_search_query_paginated() -> None:
+    """Test _async_process_search_query fetches next pages via await cursor.fetch()."""
+    store = _make_async_vector_store()
+
+    mock_cursor = MagicMock()
+    mock_cursor.fetch = AsyncMock()
+    mock_cursor.empty.side_effect = [False, False, True]
+    mock_cursor.has_more.side_effect = [True, False]
+    mock_cursor.batch.side_effect = [
+        [{"data": {"_key": "k1", "text": "page1"}, "score": 0.9, "metadata": {}}],
+        [{"data": {"_key": "k2", "text": "page2"}, "score": 0.8, "metadata": {}}],
+    ]
+
+    results = await store._async_process_search_query(mock_cursor)
+
+    mock_cursor.fetch.assert_awaited_once()
+    assert len(results) == 2
+    assert results[0][0].page_content == "page1"
+    assert results[1][0].page_content == "page2"
+
+
+def test_async_database_stored_on_init() -> None:
+    """Test that async_database is stored as self.async_db."""
+    mock_async_db = MagicMock()
+    store = _make_async_vector_store(async_db=mock_async_db)
+    assert store.async_db is mock_async_db
+
+
+def test_async_db_none_by_default() -> None:
+    """Test that async_db defaults to None when not provided."""
+    store = _make_async_vector_store()
+    assert store.async_db is None
