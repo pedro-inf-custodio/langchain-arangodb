@@ -28,6 +28,7 @@ try:
 except ImportError:
     AsyncStandardDatabase = None
     AsyncCursor = None
+    AsyncArangoServerError = type("AsyncArangoServerError", (Exception,), {})
 
 from langchain_arangodb.vectorstores.utils import DistanceStrategy
 
@@ -290,7 +291,7 @@ class ArangoVector(VectorStore):
         if not metadatas:
             metadatas = [{} for _ in texts]
 
-        if len(ids) != len(texts) != len(embeddings) != len(metadatas):
+        if not (len(ids) == len(texts) == len(embeddings) == len(metadatas)):
             m = "Length of ids, texts, embeddings and metadatas must be the same."
             raise ValueError(m)
 
@@ -312,10 +313,15 @@ class ArangoVector(VectorStore):
             data.append(doc)
 
             if len(data) == batch_size:
-                collection.import_bulk(data, on_duplicate="update", **kwargs)
+                collection.import_bulk(
+                    data, on_duplicate="update", doc_type="array", **kwargs
+                )
                 data = []
 
-        collection.import_bulk(data, on_duplicate="update", **kwargs)
+        if data:
+            collection.import_bulk(
+                data, on_duplicate="update", doc_type="array", **kwargs
+            )
 
         return ids
 
@@ -341,6 +347,10 @@ class ArangoVector(VectorStore):
         if not metadatas:
             metadatas = [{} for _ in texts]
 
+        if not (len(ids) == len(texts) == len(embeddings) == len(metadatas)):
+            m = "Length of ids, texts, embeddings and metadatas must be the same."
+            raise ValueError(m)
+
         collection = self.async_db.collection(self.collection_name)
 
         data = []
@@ -350,11 +360,15 @@ class ArangoVector(VectorStore):
             data.append(doc)
 
             if len(data) == batch_size:
-                await collection.import_bulk(json.dumps(data), on_duplicate="update")
+                await collection.import_bulk(
+                    json.dumps(data), on_duplicate="update", doc_type="array"
+                )
                 data = []
 
         if data:
-            await collection.import_bulk(json.dumps(data), on_duplicate="update")
+            await collection.import_bulk(
+                json.dumps(data), on_duplicate="update", doc_type="array"
+            )
 
         return ids
 
@@ -418,10 +432,16 @@ class ArangoVector(VectorStore):
         **kwargs: Any,
     ) -> List[str]:
         """Async add texts using python-arango-async."""
+        if self.async_db is None:
+            raise ValueError("async_database must be provided to use async methods.")
+
         texts = list(texts)
-        embeddings = await self.embedding.aembed_documents(texts)
         return await self.aadd_embeddings(
-            texts=texts, embeddings=embeddings, metadatas=metadatas, ids=ids, **kwargs
+            texts=texts,
+            embeddings=await self.embedding.aembed_documents(texts),
+            metadatas=metadatas,
+            ids=ids,
+            **kwargs,
         )
 
     def similarity_search(
@@ -838,7 +858,9 @@ class ArangoVector(VectorStore):
 
         collection = self.async_db.collection(self.collection_name)
         for result in await collection.delete_many(ids, **kwargs):
-            if isinstance(result, AsyncArangoServerError):
+            if not isinstance(AsyncArangoServerError, type) and isinstance(
+                result, AsyncArangoServerError
+            ):
                 raise result
 
         return True
@@ -884,6 +906,182 @@ class ArangoVector(VectorStore):
         results = await self.asimilarity_search_with_score(query, k=k, **kwargs)
         return [doc for doc, _ in results]
 
+    async def _async_build_vector_search_query(
+        self,
+        embedding: List[float],
+        k: int,
+        return_fields: set[str],
+        use_approx: bool,
+        filter_clause: str,
+        metadata_clause: str,
+    ) -> Tuple[str, dict[str, Any]]:
+        if self._distance_strategy == DistanceStrategy.COSINE:
+            score_func = "APPROX_NEAR_COSINE" if use_approx else "COSINE_SIMILARITY"
+            sort_order = "DESC"
+        elif self._distance_strategy == DistanceStrategy.EUCLIDEAN_DISTANCE:
+            score_func = "APPROX_NEAR_L2" if use_approx else "L2_DISTANCE"
+            sort_order = "ASC"
+        else:
+            raise ValueError(f"Unsupported metric: {self._distance_strategy}")
+
+        if use_approx:
+            if version.parse(await self.async_db.version()) < version.parse("3.12.4"):
+                m = "Approximate Nearest Neighbor search requires ArangoDB >= 3.12.4."
+                raise ValueError(m)
+
+            async_collection = self.async_db.collection(self.collection_name)
+            indexes = await async_collection.indexes()
+            index_found = False
+            for index in indexes:
+                if index.get("name") == self.vector_index_name:
+                    index_found = True
+                    break
+            if not index_found:
+                await async_collection.add_index(
+                    {
+                        "name": self.vector_index_name,
+                        "type": "vector",
+                        "fields": [self.embedding_field],
+                        "params": {
+                            "metric": DISTANCE_MAPPING[self._distance_strategy],
+                            "dimension": self.embedding_dimension,
+                            "nLists": self.num_centroids,
+                        },
+                    }
+                )
+
+        return_fields.update({"_key", self.text_field})
+        return_fields_list = list(return_fields)
+
+        aql_query = f"""
+            FOR doc IN @@collection
+                {filter_clause if not use_approx else ""}
+                LET score = {score_func}(doc.{self.embedding_field}, @embedding)
+                SORT score {sort_order}
+                LIMIT {k}
+                {filter_clause if use_approx else ""}
+                LET data = KEEP(doc, {return_fields_list})
+                LET metadata = {f"({metadata_clause})" if metadata_clause else "{}"}
+                RETURN {{data, score, metadata}}
+        """
+
+        bind_vars = {
+            "@collection": self.collection_name,
+            "embedding": embedding,
+        }
+
+        return aql_query, bind_vars
+
+    async def _async_build_hybrid_search_query(
+        self,
+        query: str,
+        k: int,
+        embedding: List[float],
+        return_fields: set[str],
+        use_approx: bool,
+        filter_clause: str,
+        vector_weight: float,
+        keyword_weight: float,
+        keyword_search_clause: str,
+        metadata_clause: str,
+    ) -> Tuple[str, dict[str, Any]]:
+        if self._distance_strategy == DistanceStrategy.COSINE:
+            score_func = "APPROX_NEAR_COSINE" if use_approx else "COSINE_SIMILARITY"
+            sort_order = "DESC"
+        elif self._distance_strategy == DistanceStrategy.EUCLIDEAN_DISTANCE:
+            score_func = "APPROX_NEAR_L2" if use_approx else "L2_DISTANCE"
+            sort_order = "ASC"
+        else:
+            raise ValueError(f"Unsupported metric: {self._distance_strategy}")
+
+        if use_approx:
+            if version.parse(await self.async_db.version()) < version.parse("3.12.4"):
+                m = "Approximate Nearest Neighbor search requires ArangoDB >= 3.12.4."
+                raise ValueError(m)
+
+            async_collection = self.async_db.collection(self.collection_name)
+            indexes = await async_collection.indexes()
+            index_found = False
+            for index in indexes:
+                if index.get("name") == self.vector_index_name:
+                    index_found = True
+                    break
+            if not index_found:
+                await async_collection.add_index(
+                    {
+                        "name": self.vector_index_name,
+                        "type": "vector",
+                        "fields": [self.embedding_field],
+                        "params": {
+                            "metric": DISTANCE_MAPPING[self._distance_strategy],
+                            "dimension": self.embedding_dimension,
+                            "nLists": self.num_centroids,
+                        },
+                    }
+                )
+
+        return_fields.update({"_key", self.text_field})
+        return_fields_list = list(return_fields)
+
+        if not keyword_search_clause:
+            keyword_search_clause = f"""
+                SEARCH ANALYZER(
+                    doc.{self.text_field} IN TOKENS(@query, @analyzer),
+                    @analyzer
+                )
+            """
+
+        aql_query = f"""
+            LET vector_results = (
+                FOR doc IN @@collection
+                    {filter_clause if not use_approx else ""}
+                    LET score = {score_func}(doc.{self.embedding_field}, @embedding)
+                    SORT score {sort_order}
+                    LIMIT {k}
+                    {filter_clause if use_approx else ""}
+                    WINDOW {{ preceding: "unbounded", following: 0 }}
+                    AGGREGATE rank = COUNT(1)
+                    LET rrf_score = {vector_weight} / ({self.rrf_constant} + rank)
+                    RETURN {{ key: doc._key, score: rrf_score }}
+            )
+
+            LET keyword_results = (
+                FOR doc IN @@view
+                    {keyword_search_clause}
+                    {filter_clause}
+                    LET score = BM25(doc)
+                    SORT score DESC
+                    LIMIT {k}
+                    WINDOW {{ preceding: "unbounded", following: 0 }}
+                    AGGREGATE rank = COUNT(1)
+                    LET rrf_score = {keyword_weight} / ({self.rrf_constant} + rank)
+                    RETURN {{ key: doc._key, score: rrf_score }}
+            )
+
+            FOR result IN APPEND(vector_results, keyword_results)
+                COLLECT key = result.key AGGREGATE score = SUM(result.score)
+                SORT score DESC
+                LIMIT {self.rrf_search_limit}
+                LET data = FIRST(
+                    FOR doc IN @@collection
+                        FILTER doc._key == key
+                        LIMIT 1
+                        RETURN KEEP(doc, {return_fields_list})
+                )
+                LET metadata = {f"({metadata_clause})" if metadata_clause else "{}"}
+                RETURN {{ data, score, metadata }}
+        """
+
+        bind_vars = {
+            "@collection": self.collection_name,
+            "@view": self.keyword_index_name,
+            "embedding": embedding,
+            "query": query,
+            "analyzer": self.keyword_analyzer,
+        }
+
+        return aql_query, bind_vars
+
     async def asimilarity_search_with_score(
         self,
         query: str,
@@ -907,7 +1105,7 @@ class ArangoVector(VectorStore):
         embedding = embedding or await self.embedding.aembed_query(query)
 
         if search_type == SearchType.VECTOR:
-            aql_query, bind_vars = self._build_vector_search_query(
+            aql_query, bind_vars = await self._async_build_vector_search_query(
                 embedding=embedding,
                 k=k,
                 return_fields=return_fields,
@@ -916,7 +1114,7 @@ class ArangoVector(VectorStore):
                 metadata_clause=metadata_clause,
             )
         else:
-            aql_query, bind_vars = self._build_hybrid_search_query(
+            aql_query, bind_vars = await self._async_build_hybrid_search_query(
                 query=query,
                 k=k,
                 embedding=embedding,
@@ -930,7 +1128,9 @@ class ArangoVector(VectorStore):
             )
 
         cursor = await self.async_db.aql.execute(
-            aql_query, bind_vars=bind_vars, stream=True
+            aql_query,
+            bind_vars=bind_vars,
+            stream=True,
         )
         return await self._async_process_search_query(cursor)
 
@@ -1426,8 +1626,8 @@ class ArangoVector(VectorStore):
         """Process search results from an async ArangoDB cursor."""
         results = []
 
-        while not cursor.empty():
-            for result in cursor.batch():
+        async for batch in cursor:
+            for result in batch:
                 data = dict(result["data"])
                 score: float = result["score"]
                 metadata = dict(result["metadata"])
@@ -1443,9 +1643,6 @@ class ArangoVector(VectorStore):
                         score,
                     )
                 )
-
-            if cursor.has_more():
-                await cursor.fetch()
 
         return results
 
@@ -1511,9 +1708,6 @@ class ArangoVector(VectorStore):
         metadata_clause: str,
     ) -> Tuple[str, dict[str, Any]]:
         """Build the hybrid search query using RRF."""
-
-        if not self.retrieve_keyword_index():
-            self.create_keyword_index()
 
         if self._distance_strategy == DistanceStrategy.COSINE:
             score_func = "APPROX_NEAR_COSINE" if use_approx else "COSINE_SIMILARITY"

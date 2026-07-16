@@ -6,6 +6,7 @@ pytest.importorskip("arangoasync", reason="python-arango-async not installed")
 
 from arango import ArangoClient  # noqa: E402
 from arangoasync import ArangoClient as AsyncArangoClient  # noqa: E402
+from arangoasync.auth import Auth  # noqa: E402
 
 from langchain_arangodb.vectorstores.arangodb_vector import (  # noqa: E402
     ArangoVector,
@@ -37,8 +38,10 @@ async def async_vector_store(
     async_client = AsyncArangoClient(hosts=arangodb_credentials["url"])
     async_db = await async_client.db(
         "_system",
-        username=arangodb_credentials["username"],
-        password=arangodb_credentials["password"],
+        auth=Auth(
+            username=arangodb_credentials["username"],
+            password=arangodb_credentials["password"],
+        ),
     )
 
     texts = ["hello world", "hello arango", "test document"]
@@ -74,8 +77,10 @@ async def test_aadd_texts(
     async_client = AsyncArangoClient(hosts=arangodb_credentials["url"])
     async_db = await async_client.db(
         "_system",
-        username=arangodb_credentials["username"],
-        password=arangodb_credentials["password"],
+        auth=Auth(
+            username=arangodb_credentials["username"],
+            password=arangodb_credentials["password"],
+        ),
     )
 
     store = ArangoVector(
@@ -183,8 +188,10 @@ async def test_async_hybrid_search(
     async_client = AsyncArangoClient(hosts=arangodb_credentials["url"])
     async_db = await async_client.db(
         "_system",
-        username=arangodb_credentials["username"],
-        password=arangodb_credentials["password"],
+        auth=Auth(
+            username=arangodb_credentials["username"],
+            password=arangodb_credentials["password"],
+        ),
     )
 
     texts = [

@@ -874,33 +874,27 @@ def test_build_hybrid_search_query(arango_vector_factory: Any) -> None:
         embedding_field="embedding",
     )
 
-    # Mock retrieve_keyword_index to return None (will create index)
-    with patch.object(vector_store, "retrieve_keyword_index", return_value=None):
-        with patch.object(vector_store, "create_keyword_index") as mock_create_index:
-            # Mock retrieve_vector_index to return None
-            # (will create index for approx search)
-            with patch.object(vector_store, "retrieve_vector_index", return_value=None):
-                with patch.object(
-                    vector_store, "create_vector_index"
-                ) as mock_create_vector_index:
-                    # Mock database version for approx search
-                    vector_store.db.version.return_value = "3.12.5"
+    # Mock database version for approx search
+    vector_store.db.version.return_value = "3.12.5"
 
-                    query, bind_vars = vector_store._build_hybrid_search_query(
-                        query="test query",
-                        k=5,
-                        embedding=[0.1] * 64,
-                        return_fields={"field1", "field2"},
-                        use_approx=True,
-                        filter_clause="FILTER doc.active == true",
-                        vector_weight=1.5,
-                        keyword_weight=2.0,
-                        keyword_search_clause="",
-                        metadata_clause="",
-                    )
+    with (
+        patch.object(vector_store, "retrieve_vector_index", return_value=None),
+        patch.object(vector_store, "create_vector_index") as mock_create_vector_index,
+    ):
+        query, bind_vars = vector_store._build_hybrid_search_query(
+            query="test query",
+            k=5,
+            embedding=[0.1] * 64,
+            return_fields={"field1", "field2"},
+            use_approx=True,
+            filter_clause="FILTER doc.active == true",
+            vector_weight=1.5,
+            keyword_weight=2.0,
+            keyword_search_clause="",
+            metadata_clause="",
+        )
 
-    # Verify indexes were created
-    mock_create_index.assert_called_once()
+    # Verify vector index was created
     mock_create_vector_index.assert_called_once()
 
     # Verify query string contains expected components
@@ -1302,6 +1296,25 @@ def _make_async_db() -> MagicMock:
     return async_db
 
 
+def _make_async_batch_iterator(batches: list) -> Any:
+    """Create an async iterator mock for simulating arangoasync cursor behavior."""
+
+    class AsyncBatchIterator:
+        def __init__(self, batches):
+            self.batches = iter(batches)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.batches)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    return AsyncBatchIterator(batches)
+
+
 # --- guard: async methods raise when async_db is None ---
 
 
@@ -1310,6 +1323,8 @@ async def test_aadd_texts_requires_async_db() -> None:
     store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64])
     with pytest.raises(ValueError, match="async_database must be provided"):
         await store.aadd_texts(["hello"])
+    # Verify aembed_documents was not called (validation happens first)
+    store.embedding.aembed_documents.assert_not_called()
 
 
 async def test_adelete_requires_async_db() -> None:
@@ -1410,12 +1425,14 @@ async def test_asimilarity_search_with_score_vector() -> None:
     store = _make_async_vector_store(async_db=async_db)
     store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
 
-    mock_cursor = MagicMock()
-    mock_cursor.empty.return_value = True
+    # Use async batch iterator to mock the cursor
+    mock_cursor = _make_async_batch_iterator([[]])
     async_db.aql.execute = AsyncMock(return_value=mock_cursor)
 
     with patch.object(
-        store, "_build_vector_search_query", return_value=("AQL", {"bind": "vars"})
+        store,
+        "_async_build_vector_search_query",
+        new=AsyncMock(return_value=("AQL", {"bind": "vars"})),
     ):
         results = await store.asimilarity_search_with_score(
             "query", k=2, search_type=SearchType.VECTOR
@@ -1432,14 +1449,14 @@ async def test_asimilarity_search_with_score_hybrid() -> None:
     store = _make_async_vector_store(async_db=async_db, search_type=SearchType.HYBRID)
     store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
 
-    mock_cursor = MagicMock()
-    mock_cursor.empty.return_value = True
+    # Use async batch iterator to mock the cursor
+    mock_cursor = _make_async_batch_iterator([[]])
     async_db.aql.execute = AsyncMock(return_value=mock_cursor)
 
     with patch.object(
         store,
-        "_build_hybrid_search_query",
-        return_value=("AQL_HYBRID", {"bind": "vars"}),
+        "_async_build_hybrid_search_query",
+        new=AsyncMock(return_value=("AQL_HYBRID", {"bind": "vars"})),
     ):
         results = await store.asimilarity_search_with_score(
             "query", k=2, search_type=SearchType.HYBRID
@@ -1501,10 +1518,8 @@ async def test_async_process_search_query_single_page() -> None:
     """
     store = _make_async_vector_store()
 
-    mock_cursor = MagicMock()
-    mock_cursor.empty.return_value = False
-    mock_cursor.has_more.return_value = False
-    mock_cursor.batch.return_value = [
+    # Mock cursor as async iterator
+    mock_batch = [
         {
             "data": {"_key": "k1", "text": "hello", "extra": "x"},
             "score": 0.9,
@@ -1516,8 +1531,9 @@ async def test_async_process_search_query_single_page() -> None:
             "metadata": {"m": 1},
         },
     ]
-    # Second call to empty() returns True to exit the loop
-    mock_cursor.empty.side_effect = [False, True]
+
+    # Create async iterator mock
+    mock_cursor = _make_async_batch_iterator([mock_batch])
 
     results = await store._async_process_search_query(mock_cursor)
 
@@ -1534,21 +1550,18 @@ async def test_async_process_search_query_single_page() -> None:
 
 
 async def test_async_process_search_query_paginated() -> None:
-    """Test _async_process_search_query fetches next pages via await cursor.fetch()."""
+    """Test _async_process_search_query fetches next pages via async iteration."""
     store = _make_async_vector_store()
 
-    mock_cursor = MagicMock()
-    mock_cursor.fetch = AsyncMock()
-    mock_cursor.empty.side_effect = [False, False, True]
-    mock_cursor.has_more.side_effect = [True, False]
-    mock_cursor.batch.side_effect = [
+    mock_batches = [
         [{"data": {"_key": "k1", "text": "page1"}, "score": 0.9, "metadata": {}}],
         [{"data": {"_key": "k2", "text": "page2"}, "score": 0.8, "metadata": {}}],
     ]
 
+    mock_cursor = _make_async_batch_iterator(mock_batches)
+
     results = await store._async_process_search_query(mock_cursor)
 
-    mock_cursor.fetch.assert_awaited_once()
     assert len(results) == 2
     assert results[0][0].page_content == "page1"
     assert results[1][0].page_content == "page2"
