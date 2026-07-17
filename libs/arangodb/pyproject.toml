@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "langchain-arangodb"
-version = "1.0.3"
+version = "2.1.0"
 description = "An integration package connecting ArangoDB and LangChain"
 authors = ["ArangoDB"]
 readme = "README.md"
@@ -13,11 +13,12 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-langchain-core = "^0.3.8"
-langchain = "^0.3.7"
+langchain-core = ">=0.3.8,<2.0.0"
+langchain = ">=0.3.7,<2.0.0"
 python-arango = "^8.0.0"
 cityhash = "^0.4.8"
 numpy = ">=1.0.0,<3.0.0"
+langchain-classic = "^1.0.0"
 
 python-arango-async = {version = "^1.2.3", optional = true}
 
