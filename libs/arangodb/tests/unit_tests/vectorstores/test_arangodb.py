@@ -1293,6 +1293,17 @@ def test_search_type_override_in_similarity_search(arango_vector_factory: Any) -
     assert docs == expected_docs
 
 
+def _make_sync_batch_cursor(items: list) -> Any:
+    """Stateful cursor mock for _iter_cursor: drives empty()/pop()/has_more()."""
+    remaining = list(items)
+
+    cursor = MagicMock()
+    cursor.empty.side_effect = lambda: len(remaining) == 0
+    cursor.pop.side_effect = lambda: remaining.pop(0)
+    cursor.has_more.return_value = False
+    return cursor
+
+
 def test_jaccard_distance_strategy(arango_vector_factory: Any) -> None:
     """Test JACCARD calculation with actual vectors and query generation."""
     vector_store = arango_vector_factory(distance_strategy=DistanceStrategy.JACCARD)
@@ -1321,18 +1332,12 @@ def test_jaccard_distance_strategy(arango_vector_factory: Any) -> None:
         {"_key": "doc3", "text": "different", "embedding": [0.0, 0.0, 1.0]},
     ]
 
-    mock_cursor = MagicMock()
-    # Set up cursor to be empty after first iteration
-    mock_cursor.empty.side_effect = [False, True]
-    mock_cursor.has_more.return_value = False
-    mock_cursor.__iter__ = MagicMock(
-        return_value=iter(
-            [
-                {"data": docs[0], "score": 1.0, "metadata": {}},
-                {"data": docs[1], "score": 0.33, "metadata": {}},
-                {"data": docs[2], "score": 0.0, "metadata": {}},
-            ]
-        )
+    mock_cursor = _make_sync_batch_cursor(
+        [
+            {"data": docs[0], "score": 1.0, "metadata": {}},
+            {"data": docs[1], "score": 0.33, "metadata": {}},
+            {"data": docs[2], "score": 0.0, "metadata": {}},
+        ]
     )
     vector_store.db.aql.execute.return_value = mock_cursor
 
@@ -1376,18 +1381,12 @@ def test_dot_product_distance_strategy(arango_vector_factory: Any) -> None:
         {"_key": "doc3", "text": "low_score", "embedding": [1.0, 0.0, 0.0]},
     ]
 
-    mock_cursor = MagicMock()
-    # Set up cursor to be empty after first iteration
-    mock_cursor.empty.side_effect = [False, True]
-    mock_cursor.has_more.return_value = False
-    mock_cursor.__iter__ = MagicMock(
-        return_value=iter(
-            [
-                {"data": docs[0], "score": 11.0, "metadata": {}},
-                {"data": docs[1], "score": 6.0, "metadata": {}},
-                {"data": docs[2], "score": 1.0, "metadata": {}},
-            ]
-        )
+    mock_cursor = _make_sync_batch_cursor(
+        [
+            {"data": docs[0], "score": 11.0, "metadata": {}},
+            {"data": docs[1], "score": 6.0, "metadata": {}},
+            {"data": docs[2], "score": 1.0, "metadata": {}},
+        ]
     )
     vector_store.db.aql.execute.return_value = mock_cursor
 
@@ -1432,18 +1431,12 @@ def test_max_inner_product_strategy(arango_vector_factory: Any) -> None:
         {"_key": "doc3", "text": "low_score", "embedding": [1.0, 0.0, 0.0]},
     ]
 
-    mock_cursor = MagicMock()
-    # Set up cursor to be empty after first iteration
-    mock_cursor.empty.side_effect = [False, True]
-    mock_cursor.has_more.return_value = False
-    mock_cursor.__iter__ = MagicMock(
-        return_value=iter(
-            [
-                {"data": docs[0], "score": 11.0, "metadata": {}},
-                {"data": docs[1], "score": 6.0, "metadata": {}},
-                {"data": docs[2], "score": 1.0, "metadata": {}},
-            ]
-        )
+    mock_cursor = _make_sync_batch_cursor(
+        [
+            {"data": docs[0], "score": 11.0, "metadata": {}},
+            {"data": docs[1], "score": 6.0, "metadata": {}},
+            {"data": docs[2], "score": 1.0, "metadata": {}},
+        ]
     )
     vector_store.db.aql.execute.return_value = mock_cursor
 

@@ -1923,8 +1923,9 @@ class ArangoVector(VectorStore):
         data: dict[str, Any]
         score: float
 
-        while not cursor.empty():
-            for result in cursor:
+        while cursor.has_more() or not cursor.empty():
+            while not cursor.empty():
+                result = cursor.pop()
                 data, score, metadata = (
                     result["data"],
                     result["score"],
