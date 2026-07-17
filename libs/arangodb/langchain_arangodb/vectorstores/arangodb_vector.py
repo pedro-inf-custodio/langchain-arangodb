@@ -1923,30 +1923,29 @@ class ArangoVector(VectorStore):
         data: dict[str, Any]
         score: float
 
-        while cursor.has_more() or not cursor.empty():
-            while not cursor.empty():
-                result = cursor.pop()
-                data, score, metadata = (
-                    result["data"],
-                    result["score"],
-                    result["metadata"],
-                )
-
-                if not data:
-                    continue
-
-                _key = data.pop("_key")
-                page_content = data.pop(self.text_field)
-                doc = Document(
-                    page_content=page_content,
-                    id=_key,
-                    metadata={**data, **metadata},
-                )
-
-                yield (doc, score)
-
-            if cursor.has_more():
+        while not cursor.empty() or cursor.has_more():
+            if cursor.empty() and cursor.has_more():
                 cursor.fetch()
+
+            result = cursor.pop()
+            data, score, metadata = (
+                result["data"],
+                result["score"],
+                result["metadata"],
+            )
+
+            if not data:
+                continue
+
+            _key = data.pop("_key")
+            page_content = data.pop(self.text_field)
+            doc = Document(
+                page_content=page_content,
+                id=_key,
+                metadata={**data, **metadata},
+            )
+
+            yield (doc, score)
 
     def _process_search_query(
         self, cursor: Cursor, stream: Optional[bool] = None
