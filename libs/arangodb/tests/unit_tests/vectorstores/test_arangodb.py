@@ -1679,32 +1679,42 @@ def _make_async_db() -> MagicMock:
     """Return a MagicMock that mimics arangoasync StandardDatabase."""
     async_db = MagicMock()
     async_collection = MagicMock()
-    async_collection.import_bulk = AsyncMock(return_value={})
-    async_collection.delete_many = AsyncMock(return_value=[])
-    async_collection.get_many = AsyncMock(return_value=[])
+    async_collection.import_bulk = AsyncMock(return_value={})  # type: ignore[method-assign]
+    async_collection.delete_many = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    async_collection.get_many = AsyncMock(return_value=[])  # type: ignore[method-assign]
     async_db.collection.return_value = async_collection
     async_db.aql = MagicMock()
-    async_db.aql.execute = AsyncMock()
+    async_db.aql.execute = AsyncMock()  # type: ignore[method-assign]
     return async_db
 
 
 def _make_async_batch_iterator(batches: list) -> Any:
-    """Create an async iterator mock for simulating arangoasync cursor behavior."""
+    """Create a cursor mock simulating arangoasync cursor batch API."""
 
-    class AsyncBatchIterator:
-        def __init__(self, batches):
-            self.batches = iter(batches)
+    class AsyncBatchCursor:
+        def __init__(self, batches: list) -> None:
+            self._batches = list(batches)
+            self._index = 0
 
-        def __aiter__(self):
-            return self
+        def empty(self) -> bool:
+            return (
+                self._index >= len(self._batches)
+                or len(self._batches[self._index]) == 0
+            )
 
-        async def __anext__(self):
-            try:
-                return next(self.batches)
-            except StopIteration:
-                raise StopAsyncIteration
+        @property
+        def batch(self) -> list:
+            return self._batches[self._index]
 
-    return AsyncBatchIterator(batches)
+        @property
+        def has_more(self) -> bool:
+            return self._index + 1 < len(self._batches)
+
+        async def fetch(self) -> list:
+            self._index += 1
+            return self._batches[self._index]
+
+    return AsyncBatchCursor(batches)
 
 
 # --- guard: async methods raise when async_db is None ---
@@ -1712,7 +1722,7 @@ def _make_async_batch_iterator(batches: list) -> Any:
 
 async def test_aadd_texts_requires_async_db() -> None:
     store = _make_async_vector_store()
-    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64])
+    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64])  # type: ignore[method-assign]
     with pytest.raises(ValueError, match="async_database must be provided"):
         await store.aadd_texts(["hello"])
     # Verify aembed_documents was not called (validation happens first)
@@ -1733,7 +1743,7 @@ async def test_aget_by_ids_requires_async_db() -> None:
 
 async def test_asimilarity_search_with_score_requires_async_db() -> None:
     store = _make_async_vector_store()
-    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)  # type: ignore[method-assign]
     with pytest.raises(ValueError, match="async_database must be provided"):
         await store.asimilarity_search_with_score("query")
 
@@ -1744,7 +1754,7 @@ async def test_asimilarity_search_with_score_requires_async_db() -> None:
 async def test_aadd_texts_calls_import_bulk() -> None:
     async_db = _make_async_db()
     store = _make_async_vector_store(async_db=async_db)
-    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64, [0.2] * 64])
+    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64, [0.2] * 64])  # type: ignore[method-assign]
 
     ids = await store.aadd_texts(["text1", "text2"])
 
@@ -1815,11 +1825,11 @@ async def test_asimilarity_search_delegates_to_with_score() -> None:
 async def test_asimilarity_search_with_score_vector() -> None:
     async_db = _make_async_db()
     store = _make_async_vector_store(async_db=async_db)
-    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)  # type: ignore[method-assign]
 
     # Use async batch iterator to mock the cursor
     mock_cursor = _make_async_batch_iterator([[]])
-    async_db.aql.execute = AsyncMock(return_value=mock_cursor)
+    async_db.aql.execute = AsyncMock(return_value=mock_cursor)  # type: ignore[method-assign]
 
     with patch.object(
         store,
@@ -1830,20 +1840,18 @@ async def test_asimilarity_search_with_score_vector() -> None:
             "query", k=2, search_type=SearchType.VECTOR
         )
 
-    async_db.aql.execute.assert_called_once_with(
-        "AQL", bind_vars={"bind": "vars"}, stream=True
-    )
+    async_db.aql.execute.assert_called_once_with("AQL", bind_vars={"bind": "vars"})
     assert results == []
 
 
 async def test_asimilarity_search_with_score_hybrid() -> None:
     async_db = _make_async_db()
     store = _make_async_vector_store(async_db=async_db, search_type=SearchType.HYBRID)
-    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)  # type: ignore[method-assign]
 
     # Use async batch iterator to mock the cursor
     mock_cursor = _make_async_batch_iterator([[]])
-    async_db.aql.execute = AsyncMock(return_value=mock_cursor)
+    async_db.aql.execute = AsyncMock(return_value=mock_cursor)  # type: ignore[method-assign]
 
     with patch.object(
         store,
@@ -1855,7 +1863,7 @@ async def test_asimilarity_search_with_score_hybrid() -> None:
         )
 
     async_db.aql.execute.assert_called_once_with(
-        "AQL_HYBRID", bind_vars={"bind": "vars"}, stream=True
+        "AQL_HYBRID", bind_vars={"bind": "vars"}
     )
     assert results == []
 
@@ -1879,7 +1887,7 @@ async def test_asimilarity_search_by_vector_delegates() -> None:
 async def test_amax_marginal_relevance_search() -> None:
     async_db = _make_async_db()
     store = _make_async_vector_store(async_db=async_db)
-    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)
+    store.embedding.aembed_query = AsyncMock(return_value=[0.1] * 64)  # type: ignore[method-assign]
 
     mock_docs = [MagicMock() for _ in range(3)]
     for i, doc in enumerate(mock_docs):

@@ -24,26 +24,13 @@ import numpy as np
 from arango.aql import Cursor
 from arango.database import StandardDatabase
 from arango.exceptions import ArangoServerError, ViewGetError
+from arangoasync.database import StandardDatabase as AsyncStandardDatabase
+from arangoasync.exceptions import ArangoServerError as AsyncArangoServerError
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from langchain_core.vectorstores.utils import maximal_marginal_relevance
 from packaging import version
-
-try:
-    from arangoasync.cursor import (
-        Cursor as AsyncCursor,  # ty: ignore[unresolved-import]
-    )
-    from arangoasync.database import (
-        StandardDatabase as AsyncStandardDatabase,  # ty: ignore[unresolved-import]
-    )
-    from arangoasync.exceptions import (
-        ArangoServerError as AsyncArangoServerError,  # ty: ignore[unresolved-import]
-    )
-except ImportError:
-    AsyncStandardDatabase = None
-    AsyncCursor = None
-    AsyncArangoServerError = type("AsyncArangoServerError", (Exception,), {})
 
 from langchain_arangodb.vectorstores.utils import DistanceStrategy
 
@@ -167,7 +154,7 @@ class ArangoVector(VectorStore):
         keyword_analyzer: str = DEFAULT_ANALYZER,
         rrf_constant: int = DEFAULT_RRF_CONSTANT,
         rrf_search_limit: int = DEFAULT_SEARCH_LIMIT,
-        async_database: Any = None,
+        async_database: Optional[AsyncStandardDatabase] = None,
     ):
         if search_type not in [SearchType.VECTOR, SearchType.HYBRID]:
             raise ValueError("search_type must be 'vector' or 'hybrid'")
@@ -185,7 +172,7 @@ class ArangoVector(VectorStore):
         self.embedding = embedding
         self.embedding_dimension = int(embedding_dimension)
         self.db = database
-        self.async_db: Optional[Any] = async_database
+        self.async_db: Optional[AsyncStandardDatabase] = async_database
         self._arango_async_db = self.db.begin_async_execution(return_result=False)
         self.search_type = search_type
         self.collection_name = collection_name
@@ -335,15 +322,11 @@ class ArangoVector(VectorStore):
             data.append(doc)
 
             if len(data) == batch_size:
-                collection.import_bulk(
-                    data, on_duplicate="update", doc_type="array", **kwargs
-                )
+                collection.import_bulk(data, on_duplicate="update", **kwargs)
                 data = []
 
         if data:
-            collection.import_bulk(
-                data, on_duplicate="update", doc_type="array", **kwargs
-            )
+            collection.import_bulk(data, on_duplicate="update", **kwargs)
 
         return ids
 
@@ -1243,6 +1226,7 @@ class ArangoVector(VectorStore):
             raise ValueError(f"Unsupported metric: {self._distance_strategy}")
 
         if use_approx:
+            assert self.async_db is not None
             if version.parse(await self.async_db.version()) < version.parse("3.12.4"):
                 m = "Approximate Nearest Neighbor search requires ArangoDB >= 3.12.4."
                 raise ValueError(m)
@@ -1313,6 +1297,7 @@ class ArangoVector(VectorStore):
             raise ValueError(f"Unsupported metric: {self._distance_strategy}")
 
         if use_approx:
+            assert self.async_db is not None
             if version.parse(await self.async_db.version()) < version.parse("3.12.4"):
                 m = "Approximate Nearest Neighbor search requires ArangoDB >= 3.12.4."
                 raise ValueError(m)
@@ -1450,7 +1435,6 @@ class ArangoVector(VectorStore):
         cursor = await self.async_db.aql.execute(
             aql_query,
             bind_vars=bind_vars,
-            stream=True,
         )
         return await self._async_process_search_query(cursor)
 
@@ -2043,8 +2027,8 @@ class ArangoVector(VectorStore):
         """Process search results from an async ArangoDB cursor."""
         results = []
 
-        async for batch in cursor:
-            for result in batch:
+        while not cursor.empty():
+            for result in cursor.batch:
                 data = dict(result["data"])
                 score: float = result["score"]
                 metadata = dict(result["metadata"])
@@ -2060,6 +2044,9 @@ class ArangoVector(VectorStore):
                         score,
                     )
                 )
+            if not cursor.has_more:
+                break
+            await cursor.fetch()
 
         return results
 
@@ -2241,6 +2228,8 @@ class ArangoVector(VectorStore):
             "embedding": embedding,
             "query": query,
             "analyzer": self.keyword_analyzer,
+            "k": k,
+            "rrf_search_limit": self.rrf_search_limit,
         }
 
         return aql_query, bind_vars

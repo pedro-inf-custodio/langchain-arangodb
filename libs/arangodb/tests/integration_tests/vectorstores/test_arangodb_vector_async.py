@@ -5,8 +5,10 @@ import pytest
 pytest.importorskip("arangoasync", reason="python-arango-async not installed")
 
 from arango import ArangoClient  # noqa: E402
-from arangoasync import ArangoClient as AsyncArangoClient  # noqa: E402
-from arangoasync.auth import Auth  # noqa: E402
+from arangoasync import (
+    ArangoClient as AsyncArangoClient,  # type: ignore[import-untyped]  # noqa: E402
+)
+from arangoasync.auth import Auth  # type: ignore[import-untyped]  # noqa: E402
 
 from langchain_arangodb.vectorstores.arangodb_vector import (  # noqa: E402
     ArangoVector,
@@ -55,7 +57,7 @@ async def async_vector_store(
         ids=ids,
         database=sync_db,
         collection_name="test_async_collection",
-        index_name="test_async_index",
+        vector_index_name="test_async_index",
         overwrite_index=True,
         async_database=async_db,
     )
