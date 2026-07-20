@@ -1676,6 +1676,7 @@ def _make_async_db() -> MagicMock:
     async_collection.delete_many = AsyncMock(return_value=[])  # type: ignore[method-assign]
     async_collection.get_many = AsyncMock(return_value=[])  # type: ignore[method-assign]
     async_db.collection.return_value = async_collection
+    async_db.has_collection = AsyncMock(return_value=True)  # type: ignore[method-assign]
     async_db.aql = MagicMock()
     async_db.aql.execute = AsyncMock()  # type: ignore[method-assign]
     return async_db

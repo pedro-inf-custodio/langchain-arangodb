@@ -197,6 +197,7 @@ class ArangoVector(VectorStore):
         self.rrf_search_limit = rrf_search_limit
 
         self.collection = self._setup_collection()
+        self._async_collection_ready = False
 
     def _setup_collection(self) -> StandardCollection:
         """Initialize the sync collection handle and indexes."""
@@ -222,8 +223,9 @@ class ArangoVector(VectorStore):
 
     async def _ensure_async_collection(self) -> None:
         """Ensure the async collection is set up before use."""
-        if self.collection is None:
+        if not self._async_collection_ready:
             await self._asetup_collection()
+            self._async_collection_ready = True
 
     @property
     def embeddings(self) -> Embeddings:
