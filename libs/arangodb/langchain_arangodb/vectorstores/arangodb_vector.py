@@ -22,10 +22,12 @@ from typing import (
 import farmhash
 import numpy as np
 from arango.aql import Cursor
+from arango.collection import StandardCollection
 from arango.database import StandardDatabase
 from arango.exceptions import ArangoServerError, ViewGetError
 from arangoasync.database import StandardDatabase as AsyncStandardDatabase
 from arangoasync.exceptions import ArangoServerError as AsyncArangoServerError
+from arangoasync.exceptions import ViewGetError as AsyncViewGetError
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
@@ -141,7 +143,7 @@ class ArangoVector(VectorStore):
         self,
         embedding: Embeddings,
         embedding_dimension: int,
-        database: StandardDatabase,
+        database: Optional[StandardDatabase] = None,
         collection_name: str = "documents",
         search_type: SearchType = DEFAULT_SEARCH_TYPE,
         embedding_field: str = "embedding",
@@ -156,6 +158,9 @@ class ArangoVector(VectorStore):
         rrf_search_limit: int = DEFAULT_SEARCH_LIMIT,
         async_database: Optional[AsyncStandardDatabase] = None,
     ):
+        if database is None and async_database is None:
+            raise ValueError("Either 'database' or 'async_database' must be provided.")
+
         if search_type not in [SearchType.VECTOR, SearchType.HYBRID]:
             raise ValueError("search_type must be 'vector' or 'hybrid'")
 
@@ -171,9 +176,11 @@ class ArangoVector(VectorStore):
 
         self.embedding = embedding
         self.embedding_dimension = int(embedding_dimension)
-        self.db = database
+        self.db: Optional[StandardDatabase] = database
         self.async_db: Optional[AsyncStandardDatabase] = async_database
-        self._arango_async_db = self.db.begin_async_execution(return_result=False)
+        self._arango_async_db = (
+            self.db.begin_async_execution(return_result=False) if self.db else None
+        )
         self.search_type = search_type
         self.collection_name = collection_name
         self.embedding_field = embedding_field
@@ -189,14 +196,34 @@ class ArangoVector(VectorStore):
         self.rrf_constant = rrf_constant
         self.rrf_search_limit = rrf_search_limit
 
-        if not self.db.has_collection(collection_name):
-            self.db.create_collection(collection_name)
+        self.collection = self._setup_collection()
 
-        self.collection = self.db.collection(self.collection_name)
+    def _setup_collection(self) -> StandardCollection:
+        """Initialize the sync collection handle and indexes."""
+        if not self.db:
+            return None
 
-        # Auto-provision keyword index for HYBRID search
+        if not self.db.has_collection(self.collection_name):
+            self.db.create_collection(self.collection_name)
+
         if self.search_type == SearchType.HYBRID:
             self.create_keyword_index()
+        return self.db.collection(self.collection_name)
+
+    async def _asetup_collection(self) -> None:
+        """Initialize the async collection handle and indexes."""
+        assert self.async_db is not None
+        if not await self.async_db.has_collection(self.collection_name):
+            await self.async_db.create_collection(self.collection_name)
+
+        self.collection = self.async_db.collection(self.collection_name)
+        if self.search_type == SearchType.HYBRID:
+            await self.acreate_keyword_index()
+
+    async def _ensure_async_collection(self) -> None:
+        """Ensure the async collection is set up before use."""
+        if self.collection is None:
+            await self._asetup_collection()
 
     @property
     def embeddings(self) -> Embeddings:
@@ -240,6 +267,14 @@ class ArangoVector(VectorStore):
         except ViewGetError:
             return None
 
+    async def aretrieve_keyword_index(self) -> Optional[dict[str, Any]]:
+        """Async retrieve the keyword index from the collection."""
+        assert self.async_db is not None
+        try:
+            return await self.async_db.view(self.keyword_index_name)  # type: ignore
+        except AsyncViewGetError:
+            return None
+
     def create_keyword_index(self) -> None:
         """Create the keyword index on the collection."""
         if self.retrieve_keyword_index():
@@ -262,12 +297,52 @@ class ArangoVector(VectorStore):
         }
         self.db.create_view(self.keyword_index_name, "search-alias", view_properties)
 
+    async def acreate_keyword_index(self) -> None:
+        """Async create the keyword index on the collection."""
+        if await self.aretrieve_keyword_index():
+            return
+
+        assert self.collection is not None
+        await self.collection.add_index(
+            {
+                "type": "inverted",
+                "name": self.keyword_index_name,
+                "fields": [
+                    {"name": self.text_field, "analyzer": self.keyword_analyzer}
+                ],
+            }
+        )
+        assert self.async_db is not None
+        await self.async_db.create_view(
+            self.keyword_index_name,
+            "search-alias",
+            {
+                "indexes": [
+                    {
+                        "collection": self.collection_name,
+                        "index": self.keyword_index_name,
+                    }
+                ]
+            },
+        )
+
     def delete_keyword_index(self) -> None:
         """Delete the keyword index from the collection."""
         view = self.retrieve_keyword_index()
         if view:
             self.db.delete_view(self.keyword_index_name)
             self.db.collection(self.collection_name).delete_index(
+                self.keyword_index_name, ignore_missing=True
+            )
+
+    async def adelete_keyword_index(self) -> None:
+        """Async delete the keyword index from the collection."""
+        assert self.async_db is not None
+        view = await self.aretrieve_keyword_index()
+        if view:
+            await self.async_db.delete_view(self.keyword_index_name)
+            assert self.collection is not None
+            await self.collection.delete_index(
                 self.keyword_index_name, ignore_missing=True
             )
 
@@ -343,6 +418,7 @@ class ArangoVector(VectorStore):
         """Async add embeddings to the vectorstore using python-arango-async."""
         if self.async_db is None:
             raise ValueError("async_database must be provided to use async methods.")
+        await self._ensure_async_collection()
 
         texts = list(texts)
 
@@ -356,7 +432,7 @@ class ArangoVector(VectorStore):
             m = "Length of ids, texts, embeddings and metadatas must be the same."
             raise ValueError(m)
 
-        collection = self.async_db.collection(self.collection_name)
+        collection = self.collection
 
         data = []
         for _key, text, embedding, metadata in zip(ids, texts, embeddings, metadatas):
@@ -1155,12 +1231,12 @@ class ArangoVector(VectorStore):
         """Async delete by vector ID using python-arango-async."""
         if self.async_db is None:
             raise ValueError("async_database must be provided to use async methods.")
+        await self._ensure_async_collection()
 
         if not ids:
             return None
 
-        collection = self.async_db.collection(self.collection_name)
-        for result in await collection.delete_many(ids, **kwargs):
+        for result in await self.collection.delete_many(ids, **kwargs):
             if isinstance(result, AsyncArangoServerError):
                 raise result
 
@@ -1189,10 +1265,10 @@ class ArangoVector(VectorStore):
         """Async get documents by their IDs using python-arango-async."""
         if self.async_db is None:
             raise ValueError("async_database must be provided to use async methods.")
+        await self._ensure_async_collection()
 
-        collection = self.async_db.collection(self.collection_name)
         docs = []
-        for doc in await collection.get_many(list(ids)):
+        for doc in await self.collection.get_many(list(ids)):
             doc = dict(doc)
             _key = doc.pop("_key")
             page_content = doc.pop(self.text_field)
@@ -1405,6 +1481,7 @@ class ArangoVector(VectorStore):
         """Async similarity search with scores using python-arango-async."""
         if self.async_db is None:
             raise ValueError("async_database must be provided to use async methods.")
+        await self._ensure_async_collection()
 
         search_type = search_type or self.search_type
         embedding = embedding or await self.embedding.aembed_query(query)
