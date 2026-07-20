@@ -1,3 +1,4 @@
+import json
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1677,6 +1678,7 @@ def _make_async_db() -> MagicMock:
     async_collection.get_many = AsyncMock(return_value=[])  # type: ignore[method-assign]
     async_db.collection.return_value = async_collection
     async_db.has_collection = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    async_db.view = AsyncMock(return_value={"name": "keyword_index"})  # type: ignore[method-assign]
     async_db.aql = MagicMock()
     async_db.aql.execute = AsyncMock()  # type: ignore[method-assign]
     return async_db
@@ -1748,19 +1750,24 @@ async def test_asimilarity_search_with_score_requires_async_db() -> None:
 async def test_aadd_texts_calls_import_bulk() -> None:
     async_db = _make_async_db()
     store = _make_async_vector_store(async_db=async_db)
-    store.embedding.aembed_documents = AsyncMock(return_value=[[0.1] * 64, [0.2] * 64])  # type: ignore[method-assign]
+    embedding_1, embedding_2 = [0.1] * 64, [0.2] * 64
+    store.embedding.aembed_documents = AsyncMock(  # type: ignore[method-assign]
+        return_value=[embedding_1, embedding_2]
+    )
 
     ids = await store.aadd_texts(["text1", "text2"])
 
     assert len(ids) == 2
     async_db.collection.return_value.import_bulk.assert_called_once()
-    # Verify the payload is a JSON string (arangoasync requirement)
-    call_arg = async_db.collection.return_value.import_bulk.call_args[0][0]
-    import json
 
-    docs = json.loads(call_arg)
-    assert docs[0]["text"] == "text1"
-    assert docs[1]["text"] == "text2"
+    # Verify the payload is a list (arangoasync requirement)
+    call_arg = async_db.collection.return_value.import_bulk.call_args[0][0]
+    parsed = json.loads(call_arg)
+    assert isinstance(parsed, list)
+    assert parsed[0]["text"] == "text1"
+    assert parsed[1]["text"] == "text2"
+    assert parsed[0]["embedding"] == embedding_1
+    assert parsed[1]["embedding"] == embedding_2
 
 
 async def test_adelete_calls_delete_many() -> None:

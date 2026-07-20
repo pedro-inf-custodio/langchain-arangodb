@@ -1,22 +1,17 @@
 """Async integration tests for ArangoVector using python-arango-async."""
 
 import pytest
+from arango import ArangoClient
+from arangoasync import ArangoClient as AsyncArangoClient
+from arangoasync.auth import Auth
 
-pytest.importorskip("arangoasync", reason="python-arango-async not installed")
-
-from arango import ArangoClient  # noqa: E402
-from arangoasync import (
-    ArangoClient as AsyncArangoClient,  # type: ignore[import-untyped]  # noqa: E402
-)
-from arangoasync.auth import Auth  # type: ignore[import-untyped]  # noqa: E402
-
-from langchain_arangodb.vectorstores.arangodb_vector import (  # noqa: E402
+from langchain_arangodb.vectorstores.arangodb_vector import (
     ArangoVector,
     SearchType,
 )
-from tests.integration_tests.utils import ArangoCredentials  # noqa: E402
+from tests.integration_tests.utils import ArangoCredentials
 
-from .fake_embeddings import FakeEmbeddings  # noqa: E402
+from .fake_embeddings import FakeEmbeddings
 
 
 @pytest.fixture(scope="module")
@@ -31,12 +26,6 @@ async def async_vector_store(
     clear_arangodb_database: None,
 ) -> ArangoVector:
     """Fixture providing an ArangoVector with both sync and async db clients."""
-    sync_client = ArangoClient(hosts=arangodb_credentials["url"])
-    sync_db = sync_client.db(
-        username=arangodb_credentials["username"],
-        password=arangodb_credentials["password"],
-    )
-
     async_client = AsyncArangoClient(hosts=arangodb_credentials["url"])
     async_db = await async_client.db(
         "_system",
@@ -50,32 +39,22 @@ async def async_vector_store(
     metadatas = [{"source": "doc1"}, {"source": "doc2"}, {"source": "doc3"}]
     ids = ["id1", "id2", "id3"]
 
-    store = ArangoVector.from_texts(
-        texts=texts,
+    store = ArangoVector(
         embedding=fake_embeddings,
-        metadatas=metadatas,
-        ids=ids,
-        database=sync_db,
+        embedding_dimension=10,
         collection_name="test_async_collection",
-        vector_index_name="test_async_index",
-        overwrite_index=True,
         async_database=async_db,
     )
-    store.create_vector_index()
+    await store.aadd_texts(texts=texts, metadatas=metadatas, ids=ids)
+    await store.acreate_vector_index()
     return store
 
 
-@pytest.mark.usefixtures("clear_arangodb_database")
 async def test_aadd_texts(
     arangodb_credentials: ArangoCredentials,
     fake_embeddings: FakeEmbeddings,
 ) -> None:
     """Test aadd_texts inserts documents via python-arango-async."""
-    sync_client = ArangoClient(hosts=arangodb_credentials["url"])
-    sync_db = sync_client.db(
-        username=arangodb_credentials["username"],
-        password=arangodb_credentials["password"],
-    )
     async_client = AsyncArangoClient(hosts=arangodb_credentials["url"])
     async_db = await async_client.db(
         "_system",
@@ -88,7 +67,6 @@ async def test_aadd_texts(
     store = ArangoVector(
         embedding=fake_embeddings,
         embedding_dimension=10,
-        database=sync_db,
         collection_name="test_async_add",
         async_database=async_db,
     )
@@ -99,18 +77,19 @@ async def test_aadd_texts(
     )
 
     assert len(ids) == 2
-    collection = sync_db.collection("test_async_add")
-    assert collection.count() == 2
+    assert await async_db.collection("test_async_add").count() == 2
 
 
-@pytest.mark.usefixtures("clear_arangodb_database")
 async def test_adelete(async_vector_store: ArangoVector) -> None:
     """Test adelete removes documents via python-arango-async."""
     result = await async_vector_store.adelete(ids=["id1", "id2"])
 
     assert result is True
-    collection = async_vector_store.db.collection(async_vector_store.collection_name)
-    assert collection.count() == 1
+    assert async_vector_store.async_db is not None
+    collection = async_vector_store.async_db.collection(
+        async_vector_store.collection_name
+    )
+    assert await collection.count() == 1
 
 
 @pytest.mark.usefixtures("clear_arangodb_database")

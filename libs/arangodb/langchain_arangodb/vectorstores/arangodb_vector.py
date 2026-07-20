@@ -25,6 +25,7 @@ from arango.aql import Cursor
 from arango.collection import StandardCollection
 from arango.database import StandardDatabase
 from arango.exceptions import ArangoServerError, ViewGetError
+from arangoasync.collection import StandardCollection as AsyncStandardCollection
 from arangoasync.database import StandardDatabase as AsyncStandardDatabase
 from arangoasync.exceptions import ArangoServerError as AsyncArangoServerError
 from arangoasync.exceptions import ViewGetError as AsyncViewGetError
@@ -196,10 +197,10 @@ class ArangoVector(VectorStore):
         self.rrf_constant = rrf_constant
         self.rrf_search_limit = rrf_search_limit
 
-        self.collection = self._setup_collection()
-        self._async_collection_ready = False
+        self.collection: Optional[StandardCollection] = self._setup_collection()
+        self.async_collection: Optional[AsyncStandardCollection] = None
 
-    def _setup_collection(self) -> StandardCollection:
+    def _setup_collection(self) -> Optional[StandardCollection]:
         """Initialize the sync collection handle and indexes."""
         if not self.db:
             return None
@@ -209,6 +210,7 @@ class ArangoVector(VectorStore):
 
         if self.search_type == SearchType.HYBRID:
             self.create_keyword_index()
+
         return self.db.collection(self.collection_name)
 
     async def _asetup_collection(self) -> None:
@@ -217,15 +219,15 @@ class ArangoVector(VectorStore):
         if not await self.async_db.has_collection(self.collection_name):
             await self.async_db.create_collection(self.collection_name)
 
-        self.collection = self.async_db.collection(self.collection_name)
         if self.search_type == SearchType.HYBRID:
             await self.acreate_keyword_index()
 
+        self.async_collection = self.async_db.collection(self.collection_name)
+
     async def _ensure_async_collection(self) -> None:
         """Ensure the async collection is set up before use."""
-        if not self._async_collection_ready:
+        if not self.async_collection:
             await self._asetup_collection()
-            self._async_collection_ready = True
 
     @property
     def embeddings(self) -> Embeddings:
@@ -255,11 +257,35 @@ class ArangoVector(VectorStore):
             }
         )
 
+    async def acreate_vector_index(self) -> None:
+        """Async create the vector index on the collection."""
+        await self._ensure_async_collection()
+        assert self.async_collection is not None
+        await self.async_collection.add_index(
+            type="vector",
+            fields=[self.embedding_field],
+            options={
+                "name": self.vector_index_name,
+                "params": {
+                    "metric": DISTANCE_MAPPING[self._distance_strategy],
+                    "dimension": self.embedding_dimension,
+                    "nLists": self.num_centroids,
+                },
+            },
+        )
+
+    async def aadd_index(self, index: dict[str, Any]) -> None:
+        """Async add an index to the collection."""
+        await self._ensure_async_collection()
+        assert self.async_collection is not None
+        await self.async_collection.add_index(index)
+
     def delete_vector_index(self) -> None:
         """Delete the vector index from the collection."""
         index = self.retrieve_vector_index()
 
         if index is not None:
+            assert self.collection is not None
             self.collection.delete_index(index["id"])
 
     def retrieve_keyword_index(self) -> Optional[dict[str, Any]]:
@@ -282,6 +308,7 @@ class ArangoVector(VectorStore):
         if self.retrieve_keyword_index():
             return
 
+        assert self.db is not None
         collection = self.db.collection(self.collection_name)
         collection.add_index(
             {
@@ -304,8 +331,9 @@ class ArangoVector(VectorStore):
         if await self.aretrieve_keyword_index():
             return
 
-        assert self.collection is not None
-        await self.collection.add_index(
+        assert self.async_db is not None
+        assert self.async_collection is not None
+        await self.async_collection.add_index(
             {
                 "type": "inverted",
                 "name": self.keyword_index_name,
@@ -314,7 +342,6 @@ class ArangoVector(VectorStore):
                 ],
             }
         )
-        assert self.async_db is not None
         await self.async_db.create_view(
             self.keyword_index_name,
             "search-alias",
@@ -332,6 +359,7 @@ class ArangoVector(VectorStore):
         """Delete the keyword index from the collection."""
         view = self.retrieve_keyword_index()
         if view:
+            assert self.db is not None
             self.db.delete_view(self.keyword_index_name)
             self.db.collection(self.collection_name).delete_index(
                 self.keyword_index_name, ignore_missing=True
@@ -343,8 +371,8 @@ class ArangoVector(VectorStore):
         view = await self.aretrieve_keyword_index()
         if view:
             await self.async_db.delete_view(self.keyword_index_name)
-            assert self.collection is not None
-            await self.collection.delete_index(
+            assert self.async_collection is not None
+            await self.async_collection.delete_index(
                 self.keyword_index_name, ignore_missing=True
             )
 
@@ -382,6 +410,7 @@ class ArangoVector(VectorStore):
             raise ValueError(m)
 
         db = self._arango_async_db if use_async_db else self.db
+        assert db is not None
         collection = db.collection(self.collection_name)
 
         data = []
@@ -434,7 +463,7 @@ class ArangoVector(VectorStore):
             m = "Length of ids, texts, embeddings and metadatas must be the same."
             raise ValueError(m)
 
-        collection = self.collection
+        assert self.async_collection is not None
 
         data = []
         for _key, text, embedding, metadata in zip(ids, texts, embeddings, metadatas):
@@ -443,14 +472,14 @@ class ArangoVector(VectorStore):
             data.append(doc)
 
             if len(data) == batch_size:
-                await collection.import_bulk(
-                    json.dumps(data), on_duplicate="update", doc_type="array", **kwargs
+                await self.async_collection.import_bulk(
+                    json.dumps(data), on_duplicate="update", doc_type="auto"
                 )
                 data = []
 
         if data:
-            await collection.import_bulk(
-                json.dumps(data), on_duplicate="update", doc_type="array", **kwargs
+            await self.async_collection.import_bulk(
+                json.dumps(data), on_duplicate="update", doc_type="auto"
             )
 
         return ids
@@ -1102,6 +1131,7 @@ class ArangoVector(VectorStore):
             metadata_clause=metadata_clause,
         )
 
+        assert self.db is not None
         cursor_result = self.db.aql.execute(aql_query, bind_vars=bind_vars, stream=True)
         assert cursor_result is not None, (
             "AQL execute should not return None with stream=True"
@@ -1196,6 +1226,7 @@ class ArangoVector(VectorStore):
             metadata_clause=metadata_clause,
         )
 
+        assert self.db is not None
         cursor_result = self.db.aql.execute(aql_query, bind_vars=bind_vars, stream=True)
         assert cursor_result is not None, (
             "AQL execute should not return None with stream=True"
@@ -1238,7 +1269,8 @@ class ArangoVector(VectorStore):
         if not ids:
             return None
 
-        for result in await self.collection.delete_many(ids, **kwargs):
+        assert self.async_collection is not None
+        for result in await self.async_collection.delete_many(ids, **kwargs):
             if isinstance(result, AsyncArangoServerError):
                 raise result
 
@@ -1270,7 +1302,8 @@ class ArangoVector(VectorStore):
         await self._ensure_async_collection()
 
         docs = []
-        for doc in await self.collection.get_many(list(ids)):
+        assert self.async_collection is not None
+        for doc in await self.async_collection.get_many(list(ids)):
             doc = dict(doc)
             _key = doc.pop("_key")
             page_content = doc.pop(self.text_field)
@@ -1309,15 +1342,15 @@ class ArangoVector(VectorStore):
                 m = "Approximate Nearest Neighbor search requires ArangoDB >= 3.12.4."
                 raise ValueError(m)
 
-            async_collection = self.async_db.collection(self.collection_name)
-            indexes = await async_collection.indexes()
+            assert self.async_collection is not None
+            indexes = await self.async_collection.indexes()
             index_found = False
             for index in indexes:
                 if index.get("name") == self.vector_index_name:
                     index_found = True
                     break
             if not index_found:
-                await async_collection.add_index(
+                await self.async_collection.add_index(
                     {
                         "name": self.vector_index_name,
                         "type": "vector",
@@ -1380,15 +1413,15 @@ class ArangoVector(VectorStore):
                 m = "Approximate Nearest Neighbor search requires ArangoDB >= 3.12.4."
                 raise ValueError(m)
 
-            async_collection = self.async_db.collection(self.collection_name)
-            indexes = await async_collection.indexes()
+            assert self.async_collection is not None
+            indexes = await self.async_collection.indexes()
             index_found = False
             for index in indexes:
                 if index.get("name") == self.vector_index_name:
                     index_found = True
                     break
             if not index_found:
-                await async_collection.add_index(
+                await self.async_collection.add_index(
                     {
                         "name": self.vector_index_name,
                         "type": "vector",
@@ -2415,6 +2448,7 @@ class ArangoVector(VectorStore):
             "k": k,
         }
 
+        assert self.db is not None
         cursor = self.db.aql.execute(aql_query, bind_vars=bind_vars, stream=True)
 
         results = list(cast(Iterable[Dict[str, Any]], cursor))
@@ -2489,6 +2523,7 @@ class ArangoVector(VectorStore):
         }
 
         # Execute combined query
+        assert self.db is not None
         combined_result = self.db.aql.execute(
             combined_query, bind_vars=bind_vars_combined, stream=True
         )
