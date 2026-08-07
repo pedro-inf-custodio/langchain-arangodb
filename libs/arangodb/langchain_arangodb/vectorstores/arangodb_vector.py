@@ -27,7 +27,7 @@ from arango.database import StandardDatabase
 from arango.exceptions import ArangoServerError, ViewGetError
 from arangoasync.collection import StandardCollection as AsyncStandardCollection
 from arangoasync.database import StandardDatabase as AsyncStandardDatabase
-from arangoasync.exceptions import ArangoServerError as AsyncArangoServerError
+from arangoasync.exceptions import ArangoClientError as AsyncArangoClientError
 from arangoasync.exceptions import ViewGetError as AsyncViewGetError
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -219,10 +219,10 @@ class ArangoVector(VectorStore):
         if not await self.async_db.has_collection(self.collection_name):
             await self.async_db.create_collection(self.collection_name)
 
+        self.async_collection = self.async_db.collection(self.collection_name)
+
         if self.search_type == SearchType.HYBRID:
             await self.acreate_keyword_index()
-
-        self.async_collection = self.async_db.collection(self.collection_name)
 
     async def _ensure_async_collection(self) -> None:
         """Ensure the async collection is set up before use."""
@@ -278,7 +278,11 @@ class ArangoVector(VectorStore):
         """Async add an index to the collection."""
         await self._ensure_async_collection()
         assert self.async_collection is not None
-        await self.async_collection.add_index(index)
+        await self.async_collection.add_index(
+            type=index["type"],
+            fields=index["fields"],
+            options={k: v for k, v in index.items() if k not in ("type", "fields")},
+        )
 
     def delete_vector_index(self) -> None:
         """Delete the vector index from the collection."""
@@ -334,13 +338,9 @@ class ArangoVector(VectorStore):
         assert self.async_db is not None
         assert self.async_collection is not None
         await self.async_collection.add_index(
-            {
-                "type": "inverted",
-                "name": self.keyword_index_name,
-                "fields": [
-                    {"name": self.text_field, "analyzer": self.keyword_analyzer}
-                ],
-            }
+            type="inverted",
+            fields=[{"name": self.text_field, "analyzer": self.keyword_analyzer}],
+            options={"name": self.keyword_index_name},
         )
         await self.async_db.create_view(
             self.keyword_index_name,
@@ -1271,8 +1271,8 @@ class ArangoVector(VectorStore):
 
         assert self.async_collection is not None
         for result in await self.async_collection.delete_many(ids, **kwargs):
-            if isinstance(result, AsyncArangoServerError):
-                raise result
+            if result.get("error"):
+                raise AsyncArangoClientError(result.get("error", "Deletion failed"))
 
         return True
 
@@ -1351,16 +1351,16 @@ class ArangoVector(VectorStore):
                     break
             if not index_found:
                 await self.async_collection.add_index(
-                    {
+                    type="vector",
+                    fields=[self.embedding_field],
+                    options={
                         "name": self.vector_index_name,
-                        "type": "vector",
-                        "fields": [self.embedding_field],
                         "params": {
                             "metric": DISTANCE_MAPPING[self._distance_strategy],
                             "dimension": self.embedding_dimension,
                             "nLists": self.num_centroids,
                         },
-                    }
+                    },
                 )
 
         return_fields.update({"_key", self.text_field})
@@ -1422,16 +1422,16 @@ class ArangoVector(VectorStore):
                     break
             if not index_found:
                 await self.async_collection.add_index(
-                    {
+                    type="vector",
+                    fields=[self.embedding_field],
+                    options={
                         "name": self.vector_index_name,
-                        "type": "vector",
-                        "fields": [self.embedding_field],
                         "params": {
                             "metric": DISTANCE_MAPPING[self._distance_strategy],
                             "dimension": self.embedding_dimension,
                             "nLists": self.num_centroids,
                         },
-                    }
+                    },
                 )
 
         return_fields.update({"_key", self.text_field})
